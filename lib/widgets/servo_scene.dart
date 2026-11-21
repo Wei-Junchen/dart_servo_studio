@@ -156,7 +156,7 @@ class _ServoSceneState extends State<ServoScene> {
             ),
             const SizedBox(height: 4),
             Text(
-              '统一测试角 ${widget.servos[widget.selected].angle.toStringAsFixed(1)}°',
+              '${widget.servos.every((s) => (s.angle - widget.servos.first.angle).abs() < .0005) ? '统一测试角' : '单舵机校准角'} ${widget.servos[widget.selected].angle.toStringAsFixed(1)}°',
               style: TextStyle(
                 color: Color(servoColors[widget.selected]),
                 fontSize: 22,

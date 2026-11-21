@@ -1,0 +1,41 @@
+name: Windows x64 release
+
+on:
+  push:
+    branches:
+      - ci/windows-x64
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install Flutter 3.47.6
+        shell: pwsh
+        run: |
+          $sdk = Join-Path $env:RUNNER_TEMP 'flutter-sdk.zip'
+          $url = 'https://storage.googleapis.com/flutter_infra_release/releases/stable/windows/flutter_windows_3.47.6-stable.zip'
+          curl.exe --fail --location --retry 3 --output $sdk $url
+          if ($LASTEXITCODE -ne 0) { throw 'Flutter SDK download failed.' }
+          $expected = 'a01bb0d26de91bc23c97cd9ccfaad281a612fb8304213fdd5df1119a09404796'
+          if ((Get-FileHash -LiteralPath $sdk -Algorithm SHA256).Hash -ne $expected) { throw 'Flutter SDK checksum mismatch.' }
+          Expand-Archive -LiteralPath $sdk -DestinationPath $env:RUNNER_TEMP
+          Join-Path $env:RUNNER_TEMP 'flutter/bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build and package
+        shell: pwsh
+        run: ./tools/package_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dart_servo_studio-windows-x64
+          path: |
+            dist/dart_servo_studio-windows-x64-*.zip
+            dist/dart_servo_studio-windows-x64-*.zip.sha256
+          compression-level: 0
+          if-no-files-found: error

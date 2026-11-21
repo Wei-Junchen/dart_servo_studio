@@ -25,6 +25,168 @@ Future<void> until(bool Function() predicate) async {
 
 void main() {
   test(
+    'v8 calibrates 0° in integer microseconds without legacy offset RPC',
+    () async {
+      final peer = FakeTarget(protocol: 8);
+      await peer.start();
+      final c = configure(peer);
+      try {
+        await c.connect();
+        expect(c.connected, true);
+        expect(c.protocol, 8);
+        expect(
+          peer.commands.where(
+            (v) =>
+                v == 'servo get' ||
+                v == 'servo saved' ||
+                v.startsWith('servo setall '),
+          ),
+          isEmpty,
+        );
+        await c.setServoCalibrationMode(0);
+        expect(peer.angles, [0, 0, 0, 0]);
+        c.nudgeActiveValue(0, 1);
+        await until(() => peer.zeroUs[0] == 1812 && !c.operation);
+        c.nudgeActiveValue(0, -1);
+        await until(() => peer.zeroUs[0] == 1811 && !c.operation);
+        await c.tuneCalibrationPoint(0, 0, 1600);
+        expect(c.servos[0].previewPulse, 1600);
+        await c.setServoCalibrationMode(-30);
+        await c.tuneCalibrationPoint(0, -30, 1450);
+        await c.setServoCalibrationMode(30);
+        await c.tuneCalibrationPoint(0, 30, 2150);
+        expect(c.servos[0].pulseAt(15, 0), 1875);
+        expect(peer.commands.contains('servo save'), false);
+        await c.saveFlash();
+        expect(peer.savedZeroUs![0], 1600);
+        expect(c.flashMatches, true);
+        await c.setServoCalibrationMode(0);
+        await c.tuneCalibrationPoint(0, 0, 1610);
+        expect(c.flashMatches, false);
+        await c.loadFlashToRam();
+        expect(c.servos[0].zeroUs, 1600);
+        expect(c.flashMatches, true);
+        await c.tuneCalibrationPoint(0, 0, 2200);
+        expect(c.servos[0].pos30Valid, false);
+        expect(c.servos[0].pos30Us, 0);
+        await c.saveFlash();
+        expect(c.flashMatches, true);
+        expect(
+          peer.commands.where(
+            (v) =>
+                v == 'servo get' ||
+                v == 'servo saved' ||
+                v.startsWith('servo setall '),
+          ),
+          isEmpty,
+        );
+      } finally {
+        await c.disconnect();
+        c.dispose();
+        await peer.close();
+      }
+    },
+  );
+
+  test('v8 held-key nudges queue while an RTT write awaits ACK', () async {
+    final peer = FakeTarget(protocol: 8)
+      ..curveAckDelay = const Duration(milliseconds: 70);
+    await peer.start();
+    final c = configure(peer);
+    try {
+      await c.connect();
+      await c.setServoCalibrationMode(0);
+      final start = peer.zeroUs[0];
+      c.nudgeActiveValue(0, 1);
+      c.nudgeActiveValue(0, 1, steps: 2);
+      c.nudgeActiveValue(0, 1, steps: 3);
+      await until(() => peer.zeroUs[0] == start + 6 && !c.operation);
+      expect(c.servos[0].zeroUs, start + 6);
+      expect(
+        peer.commands
+            .where((v) => v.startsWith('servo curve set 0 zero '))
+            .length,
+        2,
+      );
+    } finally {
+      await c.disconnect();
+      c.dispose();
+      await peer.close();
+    }
+  });
+
+  test('releasing a v8 adjustment key drops unsent queued PWM steps', () async {
+    final peer = FakeTarget(protocol: 8)
+      ..curveAckDelay = const Duration(milliseconds: 100);
+    await peer.start();
+    final c = configure(peer);
+    try {
+      await c.connect();
+      await c.setServoCalibrationMode(0);
+      final start = peer.zeroUs[0];
+      c.nudgeActiveValue(0, 1);
+      c.nudgeActiveValue(0, 1, steps: 5);
+      c.cancelQueuedNudges();
+      await until(() => c.servos[0].zeroUs == start + 1 && !c.operation);
+      expect(peer.zeroUs[0], start + 1);
+    } finally {
+      await c.disconnect();
+      c.dispose();
+      await peer.close();
+    }
+  });
+
+  test('servo three-point points affect both slopes and only explicit save writes Flash', () async {
+    final peer = FakeTarget(protocol: 7);
+    await peer.start();
+    final c = configure(peer);
+    try {
+      await c.connect();
+      expect(c.servos[0].neg30Valid, false);
+      await c.setServoCalibrationMode(-30);
+      expect(c.servoCalibrationMode, -30);
+      expect(peer.angles, [-30, 0, 0, 0]);
+      c.selectServo(1);
+      await until(() => peer.angles[1] == -30 && !c.operation);
+      expect(peer.angles, [0, -30, 0, 0]);
+      c.selectServo(0);
+      await until(() => peer.angles[0] == -30 && !c.operation);
+      await c.tuneCalibrationPoint(0, -30, 1450);
+      await c.setServoCalibrationMode(30);
+      await c.tuneCalibrationPoint(0, 30, 2150);
+      expect(peer.angles, [30, 0, 0, 0]);
+      c.nudgeActiveValue(0, 1);
+      await until(() => peer.pos30Us[0] == 2151 && !c.operation);
+      c.nudgeActiveValue(0, -1);
+      await until(() => peer.pos30Us[0] == 2150 && !c.operation);
+      expect(c.servos[0].pulseAt(-30, c.servos[0].offset), 1450);
+      expect(c.servos[0].pulseAt(30, c.servos[0].offset), 2150);
+      expect(c.servos[0].pulseAt(15, c.servos[0].offset), 1980);
+      expect(peer.commands.contains('servo save'), false);
+      await c.setServoCalibrationMode(0);
+      expect(c.servoCalibrationMode, 0);
+      expect(peer.angles, [0, 0, 0, 0]);
+      await c.saveFlash();
+      expect(c.servoCalibrationMode, 0);
+      expect(c.flashMatches, true);
+      expect(peer.savedCurveMask, 0x11);
+      await c.setServoCalibrationMode(30);
+      await c.tuneCalibrationPoint(0, 30, 2200);
+      expect(c.flashMatches, false);
+      await c.loadFlashToRam();
+      expect(c.servos[0].pos30Us, 2150);
+      expect(c.flashMatches, true);
+      await c.disarm();
+      expect(peer.manual, false);
+      expect(peer.angles, [0, 0, 0, 0]);
+    } finally {
+      await c.disconnect();
+      c.dispose();
+      await peer.close();
+    }
+  });
+
+  test(
     'older RTT firmware without cal saved keeps calibration window usable',
     () async {
       final peer = FakeTarget(protocol: 5)..supportsCalSaved = false;

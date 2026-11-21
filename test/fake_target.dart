@@ -4,7 +4,9 @@ import 'dart:io';
 
 /// Sandbox RTT peer; never opens a J-Link or talks to the physical target.
 class FakeTarget {
-  FakeTarget({this.protocol = 4});
+  FakeTarget({this.protocol = 4}) {
+    zeroUs = offsets.map((v) => (1500 - v * 2000 / 180).round()).toList();
+  }
   final int protocol;
   ServerSocket? server;
   final List<Socket> sockets = [];
@@ -16,6 +18,12 @@ class FakeTarget {
   List<int> mapping = [3, 1, 2, 4];
   List<double>? savedOffsets;
   List<int>? savedMapping;
+  List<int> neg30Us = [0, 0, 0, 0], pos30Us = [0, 0, 0, 0];
+  late List<int> zeroUs;
+  int curveMask = 0;
+  List<int>? savedNeg30Us, savedPos30Us;
+  List<int>? savedZeroUs;
+  int? savedCurveMask;
   int icmStatus = 0, adxlStatus = 0, icmMask = 0, calibrationFlashSaves = 0;
   List<int> icmLiveRaw = [0, 2048, 0];
   int icmOneGLsb = 2048, icmLiveSamples = 100;
@@ -27,6 +35,7 @@ class FakeTarget {
   bool silent = false, fragment = false;
   bool idle = true, rejectOffsets = false;
   Duration offsetAckDelay = Duration.zero;
+  Duration curveAckDelay = Duration.zero;
   Future<void> start() async {
     server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
     server!.listen((socket) {
@@ -70,9 +79,9 @@ class FakeTarget {
           } else if (command == 'servo control release') {
             control = false;
             response = 'OK CONTROL active=0 lease_ms=1500';
-          } else if (command == 'servo get') {
+          } else if (protocol < 8 && command == 'servo get') {
             response = 'OK SERVO offset_deg=${offsets.join(',')} profile=9';
-          } else if (command == 'servo saved') {
+          } else if (protocol < 8 && command == 'servo saved') {
             response = savedOffsets == null
                 ? 'ERR NO_SAVED_SERVO'
                 : 'OK SERVO_SAVED offset_deg=${savedOffsets!.join(',')} profile=9';
@@ -80,6 +89,48 @@ class FakeTarget {
             response = savedMapping == null
                 ? 'ERR NO_SAVED_MAPPING'
                 : 'OK SERVO_MAP pwm_index=${savedMapping!.join(',')}';
+          } else if (protocol >= 7 && command == 'servo curve get') {
+            response =
+                'OK SERVO_CURVE ${protocol >= 8 ? 'zero_us=${zeroUs.join(',')} ' : ''}neg30_us=${neg30Us.join(',')} pos30_us=${pos30Us.join(',')} valid=$curveMask';
+          } else if (protocol >= 7 && command == 'servo curve saved') {
+            response = savedCurveMask == null
+                ? 'ERR NO_SAVED_SERVO'
+                : 'OK SERVO_CURVE_SAVED ${protocol >= 8 ? 'zero_us=${savedZeroUs!.join(',')} ' : ''}neg30_us=${savedNeg30Us!.join(',')} pos30_us=${savedPos30Us!.join(',')} valid=$savedCurveMask';
+          } else if (protocol >= 7 &&
+              (command.startsWith('servo curve set ') ||
+                  command.startsWith('servo curve reset '))) {
+            final parts = command.split(' ');
+            final index = int.parse(parts[3]);
+            final positive = parts[4] == 'pos';
+            if (!manual) {
+              response = 'ERR MANUAL_NOT_ARMED_OR_BUSY';
+            } else {
+              final bit = 1 << (index + (positive ? 4 : 0));
+              final pulse = parts[2] == 'set' ? int.parse(parts[5]) : 0;
+              if (parts[4] == 'zero') {
+                zeroUs[index] = pulse;
+                offsets[index] = (1500 - pulse) * 180 / 2000;
+                if ((curveMask & (1 << index)) != 0 &&
+                    neg30Us[index] >= pulse) {
+                  curveMask &= ~(1 << index);
+                  neg30Us[index] = 0;
+                }
+                if ((curveMask & (1 << (index + 4))) != 0 &&
+                    pos30Us[index] <= pulse) {
+                  curveMask &= ~(1 << (index + 4));
+                  pos30Us[index] = 0;
+                }
+              } else if (positive) {
+                pos30Us[index] = pulse;
+              } else {
+                neg30Us[index] = pulse;
+              }
+              if (parts[4] != 'zero') {
+                curveMask = pulse == 0 ? curveMask & ~bit : curveMask | bit;
+              }
+              response =
+                  'OK SERVO_CURVE ${protocol >= 8 ? 'zero_us=${zeroUs.join(',')} ' : ''}neg30_us=${neg30Us.join(',')} pos30_us=${pos30Us.join(',')} valid=$curveMask';
+            }
           } else if (command == 'servo angles get') {
             response =
                 'OK SERVO_ANGLES angle_deg=${angles.join(',')} max_deg=30.000 pwm_index=${mapping.join(',')}';
@@ -106,7 +157,7 @@ class FakeTarget {
           } else if (command.startsWith('servo map set ')) {
             mapping = command.split(' ').skip(3).map(int.parse).toList();
             response = 'OK SERVO_MAP pwm_index=${mapping.join(',')}';
-          } else if (command.startsWith('servo setall ')) {
+          } else if (protocol < 8 && command.startsWith('servo setall ')) {
             if (rejectOffsets || !idle) {
               response = 'ERR BUSY_OR_NOT_IDLE';
             } else {
@@ -118,7 +169,11 @@ class FakeTarget {
             response = 'OK SERVO_ANGLES angle_deg=0,0,0,0';
           } else if (command == 'servo save') {
             savedOffsets = List.of(offsets);
+            if (protocol >= 8) savedZeroUs = List.of(zeroUs);
             savedMapping = List.of(mapping);
+            savedNeg30Us = List.of(neg30Us);
+            savedPos30Us = List.of(pos30Us);
+            savedCurveMask = curveMask;
             response = 'OK FLASH_PENDING';
             Timer(
               const Duration(milliseconds: 40),
@@ -187,7 +242,12 @@ class FakeTarget {
             response = 'ERR UNKNOWN_COMMAND';
           }
           final frame = '[DART] $id $response\r\n';
-          if (command.startsWith('servo setall ') &&
+          if (command.startsWith('servo curve set ') &&
+              curveAckDelay > Duration.zero) {
+            Timer(curveAckDelay, () {
+              if (sockets.contains(socket)) socket.add(ascii.encode(frame));
+            });
+          } else if (command.startsWith('servo setall ') &&
               offsetAckDelay > Duration.zero) {
             Timer(offsetAckDelay, () {
               if (sockets.contains(socket)) socket.add(ascii.encode(frame));

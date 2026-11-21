@@ -24,13 +24,18 @@ class StudioController extends ChangeNotifier {
   Map<String, String> icmCalibration = {}, adxlCalibration = {};
   Map<String, String> savedCalibration = {};
   bool _disconnecting = false, _disposed = false, _angleDirty = false;
+  bool _nudgeSending = false;
+  int _queuedNudgeUs = 0, _nudgeServo = -1, _nudgeMode = 0;
   bool _tickRunning = false;
   double commonAngle = 0;
-  int protocol = 0, selectedServo = 0;
+  int protocol = 0, selectedServo = 0, servoCalibrationMode = 0;
   int? address;
   String message = '离线预览 · 尚未连接设备';
   List<double>? savedOffsets;
   List<int>? savedMapping;
+  ServoCurves? savedCurves;
+  int? calibrationServo;
+  int calibrationAngle = 0;
   Timer? _timer;
   DateTime _heartbeat = DateTime(2000), _poll = DateTime(2000);
   DateTime _controlHeartbeat = DateTime(2000);
@@ -46,6 +51,9 @@ class StudioController extends ChangeNotifier {
       status?.busy == false;
   bool get draftDirty => servos.any((s) => s.settingsDirty);
   bool get canMove => canWrite && draftValid && protocol >= 4;
+  bool get keyboardNudgeInFlight =>
+      _nudgeSending && connected && !_disconnecting;
+  void cancelQueuedNudges() => _queuedNudgeUs = 0;
   bool get editable =>
       !connecting && !_disconnecting && !operation && (!connected || canWrite);
   bool get pending => draftDirty || _angleDirty;
@@ -60,7 +68,45 @@ class StudioController extends ChangeNotifier {
         (i) =>
             (savedOffsets![i] - servos[i].appliedOffset).abs() < .0005 &&
             savedMapping![i] == servos[i].appliedPwm,
-      ).every((v) => v);
+      ).every((v) => v) &&
+      (protocol < 7 ||
+          (savedCurves != null &&
+              _curvesEqual(savedCurves!, _currentCurves())));
+
+  ServoCurves _currentCurves() => ServoCurves(
+    servos.map((s) => s.neg30Us).toList(),
+    servos.map((s) => s.pos30Us).toList(),
+    List.generate(
+      4,
+      (i) =>
+          (servos[i].neg30Valid ? 1 << i : 0) |
+          (servos[i].pos30Valid ? 1 << (i + 4) : 0),
+    ).fold(0, (a, b) => a | b),
+    protocol >= 8 ? servos.map((s) => s.zeroUs).toList() : null,
+  );
+
+  bool _curvesEqual(ServoCurves a, ServoCurves b) =>
+      a.mask == b.mask &&
+      listEquals(a.neg, b.neg) &&
+      listEquals(a.pos, b.pos) &&
+      listEquals(a.zero, b.zero);
+
+  void _installCurves(ServoCurves curves) {
+    for (var i = 0; i < 4; i++) {
+      servos[i].neg30Valid = curves.mask & (1 << i) != 0;
+      servos[i].pos30Valid = curves.mask & (1 << (i + 4)) != 0;
+      servos[i].neg30Us = curves.neg[i];
+      servos[i].pos30Us = curves.pos[i];
+      if (curves.zero != null) {
+        servos[i].useZeroUs = true;
+        servos[i].zeroUs = curves.zero![i];
+        servos[i].offset = servos[i].appliedOffset =
+            (1500 - curves.zero![i]) * 180 / 2000;
+      }
+    }
+    _changed();
+  }
+
   File get preferencesFile {
     final env = Platform.environment;
     final root = Platform.isWindows
@@ -138,13 +184,8 @@ class StudioController extends ChangeNotifier {
           parseFields(await client.command('ping'))['protocol'] ?? '';
       // v4 is intentionally non-numeric so old GUIs fail closed rather than
       // applying their former protocol>=3 angle convention to new firmware.
-      protocol = protocolToken == 'v5'
-          ? 5
-          : protocolToken == 'v6'
-          ? 6
-          : protocolToken == 'v4'
-          ? 4
-          : (int.tryParse(protocolToken) ?? 0);
+      protocol =
+          int.tryParse(protocolToken.replaceFirst(RegExp(r'^v'), '')) ?? 0;
       await _readSettings();
       final ownership = parseFields(
         await client.command('servo control acquire'),
@@ -154,7 +195,9 @@ class StudioController extends ChangeNotifier {
       _controlHeartbeat = DateTime.now();
       status = DeviceStatus({...?status?.fields, 'control': '1'});
       connected = true;
-      message = protocol >= 4
+      message = protocol >= 8
+          ? '连接成功 · 三点 PWM 均按整数 µs 校准；修改只写 RAM'
+          : protocol >= 4
           ? '连接成功 · 正测试角提高 PWM 位置、正 offset 降低 PWM 位置；修改写入 RAM'
           : supported
           ? '旧协议 $protocol：offset / 映射可调；升级固件至协议 4 后可调统一测试角'
@@ -181,9 +224,11 @@ class StudioController extends ChangeNotifier {
     if (clientControl && status!.fields['control'] != '1') {
       throw StateError('MCU 舵机控制租约已失效');
     }
-    final offsets = parseFourDegrees(
-      parseFields(await client.command('servo get'))['offset_deg'],
-    );
+    final offsets = protocol >= 8
+        ? List<double>.filled(4, 0)
+        : parseFourDegrees(
+            parseFields(await client.command('servo get'))['offset_deg'],
+          );
     List<double> angles = [0, 0, 0, 0];
     List<int> mapping = List.of(defaultMapping);
     if (supported) {
@@ -199,18 +244,26 @@ class StudioController extends ChangeNotifier {
       // use the ordinary Servo_SetAng / PWM-positive direction.
       s.appliedAngle = s.angle = protocol == 3 ? -angles[i] : angles[i];
     }
+    if (protocol >= 7) {
+      _installCurves(
+        ServoCurves.parse(parseFields(await client.command('servo curve get'))),
+      );
+    }
     commonAngle = angles.every((v) => (v - angles.first).abs() < .0005)
         ? (protocol == 3 ? -angles.first : angles.first).clamp(-30, 30)
         : 0;
     _angleDirty = false;
     savedOffsets = null;
     savedMapping = null;
-    try {
-      savedOffsets = parseFourDegrees(
-        parseFields(await client.command('servo saved'))['offset_deg'],
-      );
-    } on RttCommandError catch (e) {
-      if (!e.message.startsWith('NO_SAVED_SERVO')) rethrow;
+    savedCurves = null;
+    if (protocol < 8) {
+      try {
+        savedOffsets = parseFourDegrees(
+          parseFields(await client.command('servo saved'))['offset_deg'],
+        );
+      } on RttCommandError catch (e) {
+        if (!e.message.startsWith('NO_SAVED_SERVO')) rethrow;
+      }
     }
     if (supported) {
       try {
@@ -219,6 +272,20 @@ class StudioController extends ChangeNotifier {
         );
       } on RttCommandError catch (e) {
         if (!e.message.startsWith('NO_SAVED_MAPPING')) rethrow;
+      }
+    }
+    if (protocol >= 7 && (savedOffsets != null || protocol >= 8)) {
+      try {
+        savedCurves = ServoCurves.parse(
+          parseFields(await client.command('servo curve saved')),
+        );
+        if (protocol >= 8 && savedCurves!.zero != null) {
+          savedOffsets = savedCurves!.zero!
+              .map((us) => (1500 - us) * 180 / 2000)
+              .toList();
+        }
+      } on RttCommandError catch (e) {
+        if (!e.message.startsWith('NO_SAVED_SERVO')) rethrow;
       }
     }
     _changed();
@@ -282,6 +349,8 @@ class StudioController extends ChangeNotifier {
         _poll = DateTime.now();
         if (manual && !status!.manual) {
           manual = false;
+          servoCalibrationMode = 0;
+          calibrationServo = null;
           _angleDirty = false;
           _resetAngles();
           message = '设备已退出测试（超时 / 状态变化）· 统一角已回中，offset 保留';
@@ -415,6 +484,8 @@ class StudioController extends ChangeNotifier {
   }
 
   Future<void> disarm() async {
+    servoCalibrationMode = 0;
+    calibrationServo = null;
     if (!manual || !connected) return;
     await _action(() async {
       await _flushRam();
@@ -425,6 +496,7 @@ class StudioController extends ChangeNotifier {
   Future<void> _stopManual() async {
     await _client!.command('servo manual stop');
     manual = false;
+    calibrationServo = null;
     _resetAngles();
     status = DeviceStatus(parseFields(await _client!.command('status')));
     message = '统一角已回中并释放测试控制 · offset 保留，下一次修改直接生效';
@@ -432,6 +504,8 @@ class StudioController extends ChangeNotifier {
 
   Future<void> neutral() async {
     if (!editable) return;
+    servoCalibrationMode = 0;
+    calibrationServo = null;
     if (!connected) {
       setCommonAngle(0);
       return;
@@ -448,13 +522,123 @@ class StudioController extends ChangeNotifier {
   }
 
   void selectServo(int id) {
+    if (id < 0 || id >= servos.length) return;
+    if ((servoCalibrationMode != 0 || protocol >= 8) && operation) return;
     selectedServo = id;
     _changed();
+    if ((servoCalibrationMode != 0 || protocol >= 8) && canMove) {
+      unawaited(moveCalibrationTarget(id, servoCalibrationMode));
+    }
+  }
+
+  Future<void> setServoCalibrationMode(int angle) async {
+    if (![-30, 0, 30].contains(angle) || !editable) return;
+    if (angle != 0 && (!connected || protocol < 7 || !canMove)) return;
+    servoCalibrationMode = angle;
+    _changed();
+    if (angle == 0 && protocol < 8) {
+      calibrationServo = null;
+      if (connected && manual) await neutral();
+    } else {
+      await moveCalibrationTarget(selectedServo, angle);
+    }
+  }
+
+  bool canTuneCalibrationPoint(int id) =>
+      (servoCalibrationMode != 0 || protocol >= 8) &&
+      canWrite &&
+      calibrationServo == id &&
+      calibrationAngle == servoCalibrationMode;
+
+  void nudgeActiveValue(int id, int direction, {int steps = 1}) {
+    if (servoCalibrationMode == 0 && protocol < 8) {
+      nudgeOffset(id, direction, steps: steps);
+      return;
+    }
+    if (!(canTuneCalibrationPoint(id) ||
+            (protocol >= 8 &&
+                _nudgeSending &&
+                _nudgeServo == id &&
+                _nudgeMode == servoCalibrationMode &&
+                connected &&
+                !_disconnecting &&
+                status?.idle == true)) ||
+        direction.abs() != 1 ||
+        steps < 1 ||
+        steps > 5) {
+      return;
+    }
+    if (protocol >= 8) {
+      if (_nudgeServo != id || _nudgeMode != servoCalibrationMode) {
+        _queuedNudgeUs = 0;
+        _nudgeServo = id;
+        _nudgeMode = servoCalibrationMode;
+      }
+      _queuedNudgeUs = (_queuedNudgeUs + direction * steps).clamp(-500, 500);
+      if (!_nudgeSending) unawaited(_drainNudges());
+      return;
+    }
+    _nudgeOnce(id, direction * steps);
+  }
+
+  Future<void> _drainNudges() async {
+    _nudgeSending = true;
+    try {
+      while (_queuedNudgeUs != 0 &&
+          connected &&
+          !_disconnecting &&
+          calibrationServo == _nudgeServo &&
+          calibrationAngle == _nudgeMode) {
+        final delta = _queuedNudgeUs.clamp(-5, 5);
+        _queuedNudgeUs -= delta;
+        final next = _nudgeTarget(_nudgeServo, delta);
+        if (next == null) continue;
+        await tuneCalibrationPoint(_nudgeServo, _nudgeMode, next);
+      }
+    } finally {
+      _queuedNudgeUs = 0;
+      _nudgeSending = false;
+    }
+  }
+
+  void _nudgeOnce(int id, int delta) {
+    final next = _nudgeTarget(id, delta);
+    if (next != null) {
+      unawaited(tuneCalibrationPoint(id, servoCalibrationMode, next));
+    }
+  }
+
+  int? _nudgeTarget(int id, int delta) {
+    final servo = servos[id];
+    final center = servo.useZeroUs
+        ? servo.zeroUs.toDouble()
+        : 1500 - servo.offset * 2000 / 180;
+    final positive = servoCalibrationMode > 0;
+    final current = servoCalibrationMode == 0
+        ? servo.zeroUs
+        : positive
+        ? (servo.pos30Valid ? servo.pos30Us : (center + 2000 / 6).round())
+        : (servo.neg30Valid ? servo.neg30Us : (center - 2000 / 6).round());
+    final lower = servoCalibrationMode == 0
+        ? 500
+        : positive
+        ? center.floor() + 1
+        : 500;
+    final upper = servoCalibrationMode == 0
+        ? 2500
+        : positive
+        ? 2500
+        : center.ceil() - 1;
+    if (lower > upper) return null;
+    final next = (current + delta).clamp(lower, upper);
+    return next == current ? null : next;
   }
 
   void setCommonAngle(double value) {
     if (!editable || (connected && !canMove) || !value.isFinite) return;
+    servoCalibrationMode = 0;
     commonAngle = double.parse(degrees(value.clamp(-30, 30)));
+    calibrationServo = null;
     for (final s in servos) {
       s.angle =
           commonAngle; // Protocol 3 sends the same positive angle to all four.
@@ -465,13 +649,41 @@ class StudioController extends ChangeNotifier {
 
   void clearAllOffsets() {
     if (!editable) return;
+    if (protocol >= 8) {
+      if (!connected) {
+        for (final servo in servos) {
+          servo.zeroUs = 1500;
+        }
+        message = '离线预览：四路中点已回到 1500 µs';
+        _changed();
+        return;
+      }
+      unawaited(
+        _action(() async {
+          await _ensureManual();
+          for (var i = 0; i < 4; i++) {
+            await _keepaliveIfDue();
+            final curves = ServoCurves.parse(
+              parseFields(
+                await _client!.command('servo curve set $i zero 1500'),
+              ),
+            );
+            _installCurves(curves);
+          }
+          message = '四路中点回到 1500 µs，已写入 RAM · Flash 未修改';
+        }),
+      );
+      return;
+    }
     invalidOffsets.clear();
     for (final servo in servos) {
       servo.offset = 0;
     }
     message = connected
-        ? '四路 offset 归零，正在写入 RAM · Flash 未修改'
-        : '离线预览：四路 offset 已归零';
+        ? (protocol >= 8
+              ? '四路中点回到 1500 µs，正在写入 RAM · Flash 未修改'
+              : '四路 offset 归零，正在写入 RAM · Flash 未修改')
+        : '离线预览：四路中点已回到 1500 µs';
     _changed();
   }
 
@@ -479,6 +691,52 @@ class StudioController extends ChangeNotifier {
     if (!canWrite) return;
     await _action(() async {
       final client = _client!;
+      if (protocol >= 8) {
+        final curves = ServoCurves.parse(
+          parseFields(await client.command('servo curve saved')),
+        );
+        final centers = curves.zero;
+        if (centers == null) throw StateError('Flash 缺少 0° PWM 校准值');
+        final mapping = parseMapping(
+          parseFields(await client.command('servo map saved'))['pwm_index'],
+        );
+        await _ensureManual();
+        if (!listEquals(mapping, servos.map((s) => s.appliedPwm).toList())) {
+          await client.command('servo map set ${mapping.join(' ')}');
+        }
+        for (var i = 0; i < 4; i++) {
+          await _keepaliveIfDue();
+          await client.command('servo curve set $i zero ${centers[i]}');
+        }
+        for (var i = 0; i < 4; i++) {
+          for (final positive in [false, true]) {
+            await _keepaliveIfDue();
+            final bit = 1 << (i + (positive ? 4 : 0));
+            final side = positive ? 'pos' : 'neg';
+            final command = curves.mask & bit != 0
+                ? 'servo curve set $i $side ${positive ? curves.pos[i] : curves.neg[i]}'
+                : 'servo curve reset $i $side';
+            await client.command(command);
+          }
+        }
+        _installCurves(
+          ServoCurves.parse(
+            parseFields(await client.command('servo curve get')),
+          ),
+        );
+        for (var i = 0; i < 4; i++) {
+          servos[i].pwmIndex = servos[i].appliedPwm = mapping[i];
+        }
+        if (!_curvesEqual(curves, _currentCurves())) {
+          throw StateError('Flash 三点校准载入 RAM 后回读不一致');
+        }
+        savedCurves = curves;
+        savedMapping = mapping;
+        savedOffsets = centers.map((us) => (1500 - us) * 180 / 2000).toList();
+        message = '已从 Flash 载入三点 PWM 与通道映射到 RAM · 未写 Flash';
+        log(message);
+        return;
+      }
       List<double> offsets;
       try {
         offsets = parseFourDegrees(
@@ -499,6 +757,11 @@ class StudioController extends ChangeNotifier {
       } on RttCommandError catch (e) {
         if (!e.message.startsWith('NO_SAVED_MAPPING')) rethrow;
       }
+      final curves = protocol >= 7
+          ? ServoCurves.parse(
+              parseFields(await client.command('servo curve saved')),
+            )
+          : null;
       // Validate the complete snapshot before touching RAM. Old Flash records
       // may contain offsets but no PWM map; preserve the live map in that case.
       savedOffsets = offsets;
@@ -512,6 +775,33 @@ class StudioController extends ChangeNotifier {
         await _ensureManual();
         await _flushRam();
       }
+      if (curves != null && !_curvesEqual(curves, _currentCurves())) {
+        await _ensureManual();
+        if (curves.zero != null) {
+          for (var i = 0; i < 4; i++) {
+            await client.command('servo curve set $i zero ${curves.zero![i]}');
+          }
+        }
+        for (var i = 0; i < 4; i++) {
+          for (final positive in [false, true]) {
+            final bit = 1 << (i + (positive ? 4 : 0));
+            final side = positive ? 'pos' : 'neg';
+            final command = curves.mask & bit != 0
+                ? 'servo curve set $i $side ${positive ? curves.pos[i] : curves.neg[i]}'
+                : 'servo curve reset $i $side';
+            await client.command(command);
+          }
+        }
+        _installCurves(
+          ServoCurves.parse(
+            parseFields(await client.command('servo curve get')),
+          ),
+        );
+        if (!_curvesEqual(curves, _currentCurves())) {
+          throw StateError('Flash 曲线载入 RAM 后回读不一致');
+        }
+      }
+      savedCurves = curves;
       message = mapping == null
           ? '已从 Flash 载入 offset 到 RAM；旧记录无 PWM 映射，保留当前通道'
           : '已从 Flash 载入 offset 与 PWM 映射到 RAM · 未写 Flash';
@@ -598,6 +888,7 @@ class StudioController extends ChangeNotifier {
         servos[i].appliedPwm = applied[i];
       }
     }
+    if (protocol >= 8) return;
     if (!draftValid ||
         !servos.any((s) => (s.offset - s.appliedOffset).abs() >= .0005)) {
       return;
@@ -616,6 +907,70 @@ class StudioController extends ChangeNotifier {
     for (int i = 0; i < 4; i++) {
       servos[i].appliedOffset = applied[i];
     }
+    if (protocol >= 7) {
+      _installCurves(
+        ServoCurves.parse(
+          parseFields(await _client!.command('servo curve get')),
+        ),
+      );
+    }
+  }
+
+  Future<void> moveCalibrationTarget(int id, int angle) async {
+    if (protocol < 7 ||
+        !canMove ||
+        id < 0 ||
+        id >= 4 ||
+        ![-30, 0, 30].contains(angle)) {
+      return;
+    }
+    await _action(() async {
+      selectedServo = id;
+      await _ensureManual();
+      if (draftDirty) await _flushRam();
+      for (final servo in servos) {
+        servo.angle = servo.id == id ? angle.toDouble() : 0;
+      }
+      commonAngle = 0;
+      _angleDirty = true;
+      await _flushAngles();
+      calibrationServo = id;
+      calibrationAngle = angle;
+      message = '位置 ${id + 1} 已指令到 $angle°；请对照治具，调节对应 PWM';
+    });
+  }
+
+  Future<void> tuneCalibrationPoint(int id, int angle, int pwmUs) async {
+    if (protocol < 7 ||
+        !canWrite ||
+        calibrationServo != id ||
+        calibrationAngle != angle ||
+        (angle == 0 && protocol < 8) ||
+        pwmUs < 500 ||
+        pwmUs > 2500) {
+      return;
+    }
+    await _action(() async {
+      await _keepaliveIfDue();
+      final side = angle < 0
+          ? 'neg'
+          : angle > 0
+          ? 'pos'
+          : 'zero';
+      final curves = ServoCurves.parse(
+        parseFields(await _client!.command('servo curve set $id $side $pwmUs')),
+      );
+      if ((angle < 0
+              ? curves.neg[id]
+              : angle > 0
+              ? curves.pos[id]
+              : curves.zero?[id]) !=
+          pwmUs) {
+        throw StateError('舵机端点 PWM 应答不一致');
+      }
+      _installCurves(curves);
+      message = '位置 ${id + 1} 的 $angle° PWM = $pwmUs μs，已写入 RAM；Flash 尚未保存';
+    });
   }
 
   bool _sameDegrees(List<double> a, List<double> b) =>
@@ -649,13 +1004,18 @@ class StudioController extends ChangeNotifier {
       }
       final expectedOffsets = servos.map((s) => s.offset).toList();
       final expectedMapping = servos.map((s) => s.pwmIndex).toList();
+      final expectedCurves = _currentCurves();
       // Do not hold a manual lease across a potentially long Flash transaction.
       if (manual) await _stopManual();
       await _client!.command('servo save', flash: true);
       await _readSettings();
+      servoCalibrationMode = 0;
       if (!flashMatches ||
           !_sameDegrees(savedOffsets!, expectedOffsets) ||
-          !listEquals(savedMapping, expectedMapping)) {
+          !listEquals(savedMapping, expectedMapping) ||
+          (protocol >= 7 &&
+              (savedCurves == null ||
+                  !_curvesEqual(savedCurves!, expectedCurves)))) {
         throw StateError('Flash 回读与请求设置不一致');
       }
       message = 'Flash 保存并回读验证成功 · 统一角已回中，RAM 控件仍可直接操作';
@@ -688,6 +1048,8 @@ class StudioController extends ChangeNotifier {
       icmCalibration = adxlCalibration = {};
       savedCalibration = {};
       manual = connected = clientControl = false;
+      servoCalibrationMode = 0;
+      calibrationServo = null;
       _resetAngles();
       status = null;
       if (!preserveMessage) message = '已断开 · 离线预览';

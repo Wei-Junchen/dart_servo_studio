@@ -13,6 +13,77 @@ class NoPreferencesController extends StudioController {
 }
 
 void main() {
+  testWidgets('v8 0° card uses absolute PWM microseconds instead of offset', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1480, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final c = StudioController()
+      ..connected = true
+      ..clientControl = true
+      ..protocol = 8
+      ..calibrationServo = 0
+      ..calibrationAngle = 0
+      ..status = DeviceStatus({
+        'idle': '1',
+        'manual': '1',
+        'flash_busy': '0',
+        'save_pending': '0',
+      });
+    await tester.pumpWidget(ServoStudio(controller: c));
+    expect(find.byKey(const ValueKey('curve-slider-0')), findsOneWidget);
+    expect(find.byKey(const ValueKey('offset-slider-0')), findsNothing);
+    expect(find.textContaining('中点 PWM 1500'), findsWidgets);
+    await tester.pumpWidget(const SizedBox());
+    c.dispose();
+  });
+
+  testWidgets('servo three-point mode is inline with PWM cards, not a dialog', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1480, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final c = StudioController()
+      ..connected = true
+      ..clientControl = true
+      ..protocol = 7
+      ..status = DeviceStatus({
+        'idle': '1',
+        'manual': '1',
+        'flash_busy': '0',
+        'save_pending': '0',
+      });
+    await tester.pumpWidget(ServoStudio(controller: c));
+    expect(find.byKey(const ValueKey('servo-cal-mode--30')), findsOneWidget);
+    expect(find.byKey(const ValueKey('servo-cal-mode-0')), findsOneWidget);
+    expect(find.byKey(const ValueKey('servo-cal-mode-30')), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('servo-calibration-button')),
+      findsNothing,
+    );
+    expect(find.byKey(const ValueKey('offset-slider-0')), findsOneWidget);
+    c.servoCalibrationMode = -30;
+    c.calibrationServo = 0;
+    c.calibrationAngle = -30;
+    c.settingsChanged();
+    await tester.pump();
+    expect(find.byKey(const ValueKey('curve-slider-0')), findsOneWidget);
+    expect(find.byKey(const ValueKey('offset-slider-0')), findsNothing);
+    expect(
+      tester
+          .widget<Slider>(find.byKey(const ValueKey('curve-slider-0')))
+          .onChanged,
+      isNotNull,
+    );
+    expect(find.byType(AlertDialog), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+    c.dispose();
+  });
+
   testWidgets(
     'ICM physical pose highlights the suggested face but never samples itself',
     (tester) async {

@@ -5,6 +5,7 @@ version: 1.0.0+1
 environment:
   sdk: ^3.13.5
 dependencies:
+  file_selector: ^1.0.3
   flutter:
     sdk: flutter
 dev_dependencies:

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -60,6 +61,7 @@ class _OffsetKeyboardShortcutsState extends State<_OffsetKeyboardShortcuts>
   }
 
   void _stopHold() {
+    widget.controller.cancelQueuedNudges();
     _repeatDelay?.cancel();
     _repeatTimer?.cancel();
     _repeatDelay = null;
@@ -85,7 +87,7 @@ class _OffsetKeyboardShortcutsState extends State<_OffsetKeyboardShortcuts>
         !keyboard.isAltPressed &&
         !keyboard.isMetaPressed &&
         !_isEditingText &&
-        widget.controller.editable;
+        (widget.controller.editable || widget.controller.keyboardNudgeInFlight);
   }
 
   int? _direction(LogicalKeyboardKey key) {
@@ -112,9 +114,9 @@ class _OffsetKeyboardShortcutsState extends State<_OffsetKeyboardShortcuts>
       return;
     }
     _repeatTicks++;
-    // Remain precise for short holds, then accelerate without extra RTT writes.
-    final steps = _repeatTicks < 20 ? 1 : (_repeatTicks < 50 ? 2 : 5);
-    widget.controller.nudgeOffset(servo, _heldDirection, steps: steps);
+    // 单击始终 1 µs；长按缓慢起步，逐级加速后封顶 5 µs/拍。
+    final steps = (1 + (_repeatTicks ~/ 12)).clamp(1, 5);
+    widget.controller.nudgeActiveValue(servo, _heldDirection, steps: steps);
   }
 
   void _startHold(LogicalKeyboardKey key, int direction) {
@@ -122,15 +124,15 @@ class _OffsetKeyboardShortcutsState extends State<_OffsetKeyboardShortcuts>
     _heldKey = key;
     _heldServo = widget.controller.selectedServo;
     _heldDirection = direction;
-    widget.controller.nudgeOffset(_heldServo!, direction);
-    _repeatDelay = Timer(const Duration(milliseconds: 350), () {
+    widget.controller.nudgeActiveValue(_heldServo!, direction);
+    _repeatDelay = Timer(const Duration(milliseconds: 420), () {
       if (!_canAdjust || _heldKey != key) {
         _stopHold();
         return;
       }
       _repeat();
       _repeatTimer = Timer.periodic(
-        const Duration(milliseconds: 50),
+        const Duration(milliseconds: 55),
         (_) => _repeat(),
       );
     });
@@ -390,7 +392,9 @@ class Dashboard extends StatelessWidget {
                                                 ),
                                                 const Spacer(),
                                                 Text(
-                                                  c.mixedAngles
+                                                  c.servoCalibrationMode != 0
+                                                      ? '单路 ${c.servoCalibrationMode}° 校准中'
+                                                      : c.mixedAngles
                                                       ? '当前四路角度不一致'
                                                       : '${c.commonAngle >= 0 ? '+' : ''}${c.commonAngle.toStringAsFixed(1)}° × 4',
                                                   style: const TextStyle(
@@ -413,31 +417,35 @@ class Dashboard extends StatelessWidget {
                                                 label:
                                                     '${c.commonAngle.toStringAsFixed(1)}°（四路相同）',
                                                 onChanged:
-                                                    c.editable &&
+                                                    c.servoCalibrationMode ==
+                                                            0 &&
+                                                        c.editable &&
                                                         (!c.connected ||
                                                             c.canMove)
                                                     ? c.setCommonAngle
                                                     : null,
                                               ),
                                             ),
-                                            const Row(
+                                            Row(
                                               children: [
-                                                Text(
+                                                const Text(
                                                   '−30°',
                                                   style: TextStyle(
                                                     color: muted,
                                                     fontSize: 9,
                                                   ),
                                                 ),
-                                                Spacer(),
+                                                const Spacer(),
                                                 Text(
-                                                  '正测试角与正 offset 反向 · 不保存测试角',
-                                                  style: TextStyle(
+                                                  c.protocol >= 8
+                                                      ? '正测试角提高 PWM · 三点 PWM 独立校准 · 不保存测试角'
+                                                      : '正测试角与正 offset 反向 · 不保存测试角',
+                                                  style: const TextStyle(
                                                     color: muted,
                                                     fontSize: 9,
                                                   ),
                                                 ),
-                                                Spacer(),
+                                                const Spacer(),
                                                 Text(
                                                   '+30°',
                                                   style: TextStyle(
@@ -482,7 +490,7 @@ class Dashboard extends StatelessWidget {
                                                           if (await confirm(
                                                             context,
                                                             '保存到 Flash',
-                                                            '保存四路 servo_offset 和真实 PWM 映射，保留传感器校准参数。\n未完成的 RAM 修改会先同步，统一测试角回到 0°，再写入和回读校验。servo_angle 不会保存。',
+                                                            '保存四路 -30/0/+30° PWM 校准值和真实 PWM 映射，保留传感器校准参数。\n未完成的 RAM 修改会先同步，测试角回到 0°，再写入和回读校验。servo_angle 不会保存。',
                                                             '保存 Flash',
                                                           )) {
                                                             await c.saveFlash();
@@ -502,10 +510,12 @@ class Dashboard extends StatelessWidget {
                                               c.connected &&
                                                       c.protocol >= 2 &&
                                                       c.protocol < 4
-                                                  ? '旧协议 ${c.protocol}：请升级协议 4 后使用统一测试角；offset 仍可调。'
+                                                  ? '旧协议 ${c.protocol}：请升级协议 8 后使用 µs 三点校准。'
                                                   : c.connected &&
                                                         c.protocol < 2
-                                                  ? '协议 1 只读：请升级协议 4 后进行舵机调试。'
+                                                  ? '协议 1 只读：请升级协议 8 后进行舵机调试。'
+                                                  : c.protocol >= 8
+                                                  ? '协议 8：三点均使用 PWM µs，短按 1 µs，长按逐级加速。'
                                                   : '协议 4：正测试角增大 PWM 位置，正 offset 减小；飞控输出不变。',
                                               style: const TextStyle(
                                                 fontSize: 10,
@@ -654,6 +664,71 @@ class Dashboard extends StatelessWidget {
                                       ),
                                     ),
                                     const SizedBox(height: 8),
+                                    Text(
+                                      'PWM 校准模式',
+                                      style: TextStyle(
+                                        color: muted,
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 5),
+                                    Wrap(
+                                      spacing: 7,
+                                      runSpacing: 4,
+                                      children: [
+                                        for (final angle in [-30, 0, 30])
+                                          ChoiceChip(
+                                            key: ValueKey(
+                                              'servo-cal-mode-$angle',
+                                            ),
+                                            label: Text('$angle°'),
+                                            selected:
+                                                c.servoCalibrationMode == angle,
+                                            onSelected: angle == 0
+                                                ? (c.editable
+                                                      ? (_) => c
+                                                            .setServoCalibrationMode(
+                                                              angle,
+                                                            )
+                                                      : null)
+                                                : (c.protocol >= 7 && c.canMove
+                                                      ? (_) => c
+                                                            .setServoCalibrationMode(
+                                                              angle,
+                                                            )
+                                                      : null),
+                                          ),
+                                      ],
+                                    ),
+                                    if (c.servoCalibrationMode != 0) ...[
+                                      const SizedBox(height: 4),
+                                      TextButton.icon(
+                                        key: const ValueKey(
+                                          'servo-cal-move-selected',
+                                        ),
+                                        onPressed: c.canMove
+                                            ? () => c.moveCalibrationTarget(
+                                                c.selectedServo,
+                                                c.servoCalibrationMode,
+                                              )
+                                            : null,
+                                        icon: const Icon(
+                                          Icons.my_location,
+                                          size: 14,
+                                        ),
+                                        label: Text(
+                                          '移动位置 ${c.selectedServo + 1} 到 ${c.servoCalibrationMode}°',
+                                        ),
+                                      ),
+                                      const Text(
+                                        '仅选中舵机运动；端点只写 RAM，保存 Flash 需手动确认。',
+                                        style: TextStyle(
+                                          color: muted,
+                                          fontSize: 9,
+                                        ),
+                                      ),
+                                    ],
+                                    const SizedBox(height: 6),
                                     Expanded(
                                       child: ListView.separated(
                                         itemCount: 4,
@@ -674,15 +749,19 @@ class Dashboard extends StatelessWidget {
                                             key: const ValueKey(
                                               'clear-all-offsets',
                                             ),
-                                            onPressed: c.editable
+                                            onPressed:
+                                                c.editable &&
+                                                    c.servoCalibrationMode == 0
                                                 ? () {
                                                     FocusScope.of(context)
                                                         .unfocus();
                                                     c.clearAllOffsets();
                                                   }
                                                 : null,
-                                            child: const Text(
-                                              'offset 全归零',
+                                            child: Text(
+                                              c.protocol >= 8
+                                                  ? '中点全回 1500 µs'
+                                                  : 'offset 全归零',
                                               style: TextStyle(fontSize: 10),
                                             ),
                                           ),
@@ -693,7 +772,9 @@ class Dashboard extends StatelessWidget {
                                             key: const ValueKey(
                                               'load-flash-to-ram',
                                             ),
-                                            onPressed: c.canWrite
+                                            onPressed:
+                                                c.canWrite &&
+                                                    c.servoCalibrationMode == 0
                                                 ? () async {
                                                     FocusScope.of(context)
                                                         .unfocus();
@@ -818,6 +899,7 @@ class _ConnectionPanel extends StatelessWidget {
   }) => Padding(
     padding: const EdgeInsets.only(bottom: 12),
     child: TextFormField(
+      key: ValueKey('$label:$initial'),
       initialValue: initial,
       enabled: !c.connected && !c.connecting,
       onChanged: change,
@@ -856,11 +938,41 @@ class _ConnectionPanel extends StatelessWidget {
                         },
                 ),
                 const SizedBox(height: 8),
-                _field(
-                  'Firmware ELF',
-                  c.settings.elf,
-                  (v) => c.settings.elf = v,
-                  help: '只解析 RTT 地址，不下载；须匹配板上固件',
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: _field(
+                        'Firmware ELF',
+                        c.settings.elf,
+                        (v) => c.settings.elf = v,
+                        help: '只解析 RTT 地址，不下载；须匹配板上固件',
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: OutlinedButton(
+                        onPressed: c.connected || c.connecting
+                            ? null
+                            : () async {
+                                const typeGroup = XTypeGroup(
+                                  label: 'ELF firmware',
+                                  extensions: ['elf'],
+                                );
+                                final file = await openFile(
+                                  acceptedTypeGroups: [typeGroup],
+                                );
+                                if (file != null) {
+                                  c.settings.elf = file.path;
+                                  redraw(() {});
+                                  c.settingsChanged();
+                                }
+                              },
+                        child: const Text('选择…'),
+                      ),
+                    ),
+                  ],
                 ),
                 _field(
                   'RTT 地址（可覆盖 ELF）',
@@ -1037,6 +1149,18 @@ class _ServoCard extends StatefulWidget {
 class _ServoCardState extends State<_ServoCard> {
   final offsetController = TextEditingController();
   final offsetFocus = FocusNode();
+  int? pwmDraft;
+  int lastMode = 0;
+
+  Future<void> commitPwm(int pwmUs) async {
+    await widget.controller.tuneCalibrationPoint(
+      widget.id,
+      widget.controller.servoCalibrationMode,
+      pwmUs,
+    );
+    if (mounted) setState(() => pwmDraft = null);
+  }
+
   @override
   void dispose() {
     offsetController.dispose();
@@ -1050,7 +1174,47 @@ class _ServoCardState extends State<_ServoCard> {
         s = c.servos[widget.id],
         color = Color(servoColors[s.id]);
     final enabled = c.editable;
-    if (!offsetFocus.hasFocus && !c.invalidOffsets.contains(s.id)) {
+    final mode = c.servoCalibrationMode;
+    if (lastMode != mode) {
+      pwmDraft = null;
+      lastMode = mode;
+    }
+    final zeroMode = mode == 0 && c.protocol >= 8;
+    final legacyOffsetMode = mode == 0 && !zeroMode;
+    final center = s.useZeroUs
+        ? s.zeroUs.toDouble()
+        : 1500 - s.offset * 2000 / 180;
+    final positive = mode > 0;
+    final endpoint = zeroMode
+        ? s.zeroUs
+        : positive
+        ? (s.pos30Valid ? s.pos30Us : (center + 2000 / 6).round())
+        : (s.neg30Valid ? s.neg30Us : (center - 2000 / 6).round());
+    final pwmMin = zeroMode
+        ? 500
+        : positive
+        ? center.floor() + 1
+        : 500;
+    final pwmMax = zeroMode
+        ? 2500
+        : positive
+        ? 2500
+        : center.ceil() - 1;
+    final rangeValid = pwmMin < pwmMax;
+    final pwmValue = rangeValid
+        ? (pwmDraft ?? endpoint).clamp(pwmMin, pwmMax)
+        : 1500;
+    final canTune = rangeValid && c.canTuneCalibrationPoint(s.id);
+    final savedBit = 1 << (s.id + (positive ? 4 : 0));
+    final savedZero = c.savedCurves?.zero;
+    final savedEndpoint = zeroMode
+        ? (savedZero == null ? null : savedZero[s.id])
+        : c.savedCurves != null && c.savedCurves!.mask & savedBit != 0
+        ? (positive ? c.savedCurves!.pos[s.id] : c.savedCurves!.neg[s.id])
+        : null;
+    if (legacyOffsetMode &&
+        !offsetFocus.hasFocus &&
+        !c.invalidOffsets.contains(s.id)) {
       offsetController.text = s.offset.toStringAsFixed(3);
     }
     return GestureDetector(
@@ -1099,88 +1263,164 @@ class _ServoCardState extends State<_ServoCard> {
                 ),
                 const Spacer(),
                 Text(
-                  '${s.offset >= 0 ? '+' : ''}${s.offset.toStringAsFixed(1)}°',
+                  legacyOffsetMode
+                      ? '${s.offset >= 0 ? '+' : ''}${s.offset.toStringAsFixed(1)}°'
+                      : '$pwmValue μs',
                   style: TextStyle(
                     color: color,
-                    fontSize: 22,
+                    fontSize: legacyOffsetMode ? 22 : 18,
                     fontWeight: FontWeight.w500,
                   ),
                 ),
               ],
             ),
-            SizedBox(
-              height: 36,
-              child: Row(
-                children: [
-                  IconButton(
-                    key: ValueKey('offset-minus-${s.id}'),
-                    tooltip: 'offset 减小 0.1°',
-                    constraints: const BoxConstraints(
-                      minWidth: 32,
-                      minHeight: 32,
-                    ),
-                    padding: EdgeInsets.zero,
-                    iconSize: 17,
-                    onPressed: enabled && s.offset > -90
-                        ? () {
-                            offsetFocus.unfocus();
-                            c.nudgeOffset(s.id, -1);
-                          }
-                        : null,
-                    icon: const Icon(Icons.remove),
-                  ),
-                  Expanded(
-                    child: Slider(
-                      key: ValueKey('offset-slider-${s.id}'),
-                      value: s.offset.clamp(-90, 90),
-                      min: -90,
-                      max: 90,
-                      divisions: 1800,
-                      activeColor: color,
-                      label: 'offset ${s.offset.toStringAsFixed(1)}°',
-                      onChanged: enabled
-                          ? (v) {
+            if (legacyOffsetMode) ...[
+              SizedBox(
+                height: 36,
+                child: Row(
+                  children: [
+                    IconButton(
+                      key: ValueKey('offset-minus-${s.id}'),
+                      tooltip: 'offset 减小 0.1°',
+                      constraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      padding: EdgeInsets.zero,
+                      iconSize: 17,
+                      onPressed: enabled && s.offset > -90
+                          ? () {
                               offsetFocus.unfocus();
-                              c.setOffset(s.id, v);
+                              c.nudgeOffset(s.id, -1);
                             }
                           : null,
+                      icon: const Icon(Icons.remove),
+                    ),
+                    Expanded(
+                      child: Slider(
+                        key: ValueKey('offset-slider-${s.id}'),
+                        value: s.offset.clamp(-90, 90),
+                        min: -90,
+                        max: 90,
+                        divisions: 1800,
+                        activeColor: color,
+                        label: 'offset ${s.offset.toStringAsFixed(1)}°',
+                        onChanged: enabled
+                            ? (v) {
+                                offsetFocus.unfocus();
+                                c.setOffset(s.id, v);
+                              }
+                            : null,
+                      ),
+                    ),
+                    IconButton(
+                      key: ValueKey('offset-plus-${s.id}'),
+                      tooltip: 'offset 增大 0.1°',
+                      constraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      padding: EdgeInsets.zero,
+                      iconSize: 17,
+                      onPressed: enabled && s.offset < 90
+                          ? () {
+                              offsetFocus.unfocus();
+                              c.nudgeOffset(s.id, 1);
+                            }
+                          : null,
+                      icon: const Icon(Icons.add),
+                    ),
+                  ],
+                ),
+              ),
+              Row(
+                children: [
+                  const Text(
+                    '−90°',
+                    style: TextStyle(color: muted, fontSize: 9),
+                  ),
+                  const Spacer(),
+                  InkWell(
+                    onTap: enabled ? () => c.setOffset(s.id, 0) : null,
+                    child: const Text(
+                      'servo_offset · 点此设为 0',
+                      style: TextStyle(color: muted, fontSize: 10),
                     ),
                   ),
-                  IconButton(
-                    key: ValueKey('offset-plus-${s.id}'),
-                    tooltip: 'offset 增大 0.1°',
-                    constraints: const BoxConstraints(
-                      minWidth: 32,
-                      minHeight: 32,
-                    ),
-                    padding: EdgeInsets.zero,
-                    iconSize: 17,
-                    onPressed: enabled && s.offset < 90
-                        ? () {
-                            offsetFocus.unfocus();
-                            c.nudgeOffset(s.id, 1);
-                          }
-                        : null,
-                    icon: const Icon(Icons.add),
+                  const Spacer(),
+                  const Text(
+                    '+90°',
+                    style: TextStyle(color: muted, fontSize: 9),
                   ),
                 ],
               ),
-            ),
-            Row(
-              children: [
-                const Text('−90°', style: TextStyle(color: muted, fontSize: 9)),
-                const Spacer(),
-                InkWell(
-                  onTap: enabled ? () => c.setOffset(s.id, 0) : null,
-                  child: const Text(
-                    'servo_offset · 点此设为 0',
-                    style: TextStyle(color: muted, fontSize: 10),
-                  ),
+              Text(
+                c.savedOffsets == null
+                    ? 'Flash offset：未保存'
+                    : 'Flash offset：${c.savedOffsets![s.id].toStringAsFixed(3)}°',
+                style: const TextStyle(color: muted, fontSize: 9),
+              ),
+            ] else ...[
+              SizedBox(
+                height: 36,
+                child: Row(
+                  children: [
+                    IconButton(
+                      key: ValueKey('curve-minus-${s.id}'),
+                      tooltip: '$mode° PWM 减少 1 μs',
+                      constraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      padding: EdgeInsets.zero,
+                      iconSize: 17,
+                      onPressed: canTune && pwmValue > pwmMin
+                          ? () => commitPwm(pwmValue - 1)
+                          : null,
+                      icon: const Icon(Icons.remove),
+                    ),
+                    Expanded(
+                      child: Slider(
+                        key: ValueKey('curve-slider-${s.id}'),
+                        value: pwmValue.toDouble(),
+                        min: rangeValid ? pwmMin.toDouble() : 500,
+                        max: rangeValid ? pwmMax.toDouble() : 2500,
+                        activeColor: color,
+                        label: '$mode° · $pwmValue μs',
+                        onChanged: canTune
+                            ? (v) => setState(() => pwmDraft = v.round())
+                            : null,
+                        onChangeEnd: canTune
+                            ? (v) => commitPwm(v.round())
+                            : null,
+                      ),
+                    ),
+                    IconButton(
+                      key: ValueKey('curve-plus-${s.id}'),
+                      tooltip: '$mode° PWM 增加 1 μs',
+                      constraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      padding: EdgeInsets.zero,
+                      iconSize: 17,
+                      onPressed: canTune && pwmValue < pwmMax
+                          ? () => commitPwm(pwmValue + 1)
+                          : null,
+                      icon: const Icon(Icons.add),
+                    ),
+                  ],
                 ),
-                const Spacer(),
-                const Text('+90°', style: TextStyle(color: muted, fontSize: 9)),
-              ],
-            ),
+              ),
+              Text(
+                !rangeValid
+                    ? '中点接近 PWM 边界，请先切回 0° 调整 µs'
+                    : canTune
+                    ? '$mode° 端点 · RAM 实时调整'
+                    : '先点选此位置，将舵机移动到 $mode° 后调整',
+                style: const TextStyle(color: muted, fontSize: 9),
+              ),
+            ],
             const SizedBox(height: 9),
             Row(
               children: [
@@ -1204,35 +1444,63 @@ class _ServoCardState extends State<_ServoCard> {
                           ),
                         ),
                     ],
-                    onChanged: enabled ? (v) => c.setMapping(s.id, v!) : null,
+                    onChanged: enabled && mode == 0
+                        ? (v) => c.setMapping(s.id, v!)
+                        : null,
                   ),
                 ),
                 const SizedBox(width: 9),
                 Expanded(
-                  child: TextField(
-                    key: ValueKey('offset-input-${s.id}'),
-                    controller: offsetController,
-                    focusNode: offsetFocus,
-                    enabled: enabled,
-                    style: const TextStyle(fontSize: 11),
-                    decoration: InputDecoration(
-                      labelText: 'servo_offset / °',
-                      errorText: c.invalidOffsets.contains(s.id)
-                          ? '范围 −90..90'
-                          : null,
-                    ),
-                    onChanged: (v) => c.setOffsetInput(s.id, v),
-                    onSubmitted: (v) {
-                      offsetFocus.unfocus();
-                      setState(() {});
-                    },
-                  ),
+                  child: legacyOffsetMode
+                      ? TextField(
+                          key: ValueKey('offset-input-${s.id}'),
+                          controller: offsetController,
+                          focusNode: offsetFocus,
+                          enabled: enabled,
+                          style: const TextStyle(fontSize: 11),
+                          decoration: InputDecoration(
+                            labelText: 'servo_offset / °',
+                            errorText: c.invalidOffsets.contains(s.id)
+                                ? '范围 −90..90'
+                                : null,
+                          ),
+                          onChanged: (v) => c.setOffsetInput(s.id, v),
+                          onSubmitted: (v) {
+                            offsetFocus.unfocus();
+                            setState(() {});
+                          },
+                        )
+                      : Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              '−30/0/+30 PWM 校准',
+                              style: TextStyle(color: color, fontSize: 10),
+                            ),
+                            Text(
+                              c.savedCurves == null
+                                  ? 'Flash：未保存'
+                                  : savedEndpoint == null
+                                  ? 'Flash：默认斜率'
+                                  : 'Flash：$savedEndpoint μs',
+                              style: const TextStyle(
+                                color: muted,
+                                fontSize: 10,
+                              ),
+                            ),
+                          ],
+                        ),
                 ),
               ],
             ),
             const SizedBox(height: 5),
             Text(
-              '测试角 ${s.angle.toStringAsFixed(1)}° · PWM 相对中位 ${s.pwmPositionDelta.toStringAsFixed(1)}°${s.directionClamped ? ' · 已限幅' : ''}',
+              legacyOffsetMode
+                  ? '测试角 ${s.angle.toStringAsFixed(1)}° · PWM 相对中位 ${s.pwmPositionDelta.toStringAsFixed(1)}°${s.directionClamped ? ' · 已限幅' : ''}'
+                  : zeroMode
+                  ? '目标 0° · 中点 PWM ${s.zeroUs} μs · 每次微调 1 μs'
+                  : '目标 $mode° · 0° PWM ${center.round()} μs · ${(positive ? s.pos30Valid : s.neg30Valid) ? '已校准' : '默认斜率'}',
               style: TextStyle(
                 color: s.directionClamped ? const Color(0xfff8bb65) : muted,
                 fontSize: 10,
@@ -1241,7 +1509,7 @@ class _ServoCardState extends State<_ServoCard> {
             const SizedBox(height: 2),
             Text(
               c.connected && c.supported
-                  ? '设备 RAM：offset ${s.appliedOffset.toStringAsFixed(3)}° · PWM ${s.appliedPwm} · ${s.pulse.toStringAsFixed(0)} µs'
+                  ? '设备 RAM：中点 ${s.zeroUs} µs · PWM ${s.appliedPwm} · 当前 ${s.pulse.toStringAsFixed(0)} µs'
                   : '离线预览 ${s.previewPulse.toStringAsFixed(0)} µs · 不发送指令',
               style: const TextStyle(color: muted, fontSize: 9),
             ),
