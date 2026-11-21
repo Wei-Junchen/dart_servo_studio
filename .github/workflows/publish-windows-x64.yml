@@ -1,0 +1,46 @@
+name: Publish Windows x64 v1.0.0+1
+
+on:
+  push:
+    branches:
+      - ci/publish-windows-x64-v1
+
+permissions: {}
+
+jobs:
+  release:
+    if: github.repository == 'Wei-Junchen/dart_servo_studio'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify CI build and publish Windows release
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$(mktemp -d)"
+          cd "$stage"
+          tag='v1.0.0+1'
+          source_commit='68b535d80df411cd200cbe1b2db8a6ac42761177'
+          asset='dart_servo_studio-windows-x64-v1.0.0-build1.zip'
+          original='dart_servo_studio-windows-x64-v1.0.0+1.zip'
+          digest='3599a775a35c7122d395a942ac43afd5d69c57d619298b31141a436fdbd22555'
+          tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v1.0.0%2B1" --jq '.object.sha')"
+          test "$tagged" = "$source_commit"
+          gh run download 44904588089 --repo "$GITHUB_REPOSITORY" --name dart_servo_studio-windows-x64
+          printf '%s  %s\n' "$digest" "$original" | sha256sum -c -
+          mv "$original" "$asset"
+          sha256sum "$asset" > "$asset.sha256"
+          cat > notes.md <<'EOF'
+          Windows x64 便携版。解压整个 ZIP 后运行 `start.cmd`，离线预览无需 Flutter 或 J-Link。
+
+          如 Windows 提示缺少 Visual C++ 运行库，请安装 [Microsoft x64 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe)。连接实体探针时另装 [SEGGER Windows 64-bit 软件包](https://www.segger.com/downloads/jlink/)；本发行包不包含 J-Link。
+
+          产物来自 [Windows x64 CI 构建](https://github.com/Wei-Junchen/dart_servo_studio/actions/runs/44904588089)。
+          EOF
+          gh release create "$tag" "$asset" "$asset.sha256" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "Dart Servo Studio $tag" --notes-file notes.md
